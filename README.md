@@ -2,15 +2,15 @@
 
 [한국어](README.ko.md) | **English**
 
-An MCP server (macOS) that manages one **Claude Remote Control** session server per project.
+An MCP server (macOS / Windows) that manages one **Claude Remote Control** session server per project.
 
-Pick a root folder once. Every sub-folder becomes a project, and each project gets its own `claude remote-control` server running as a launchd agent. You then create new sessions per project from the **Code tab** of the Claude app, and a "manager" session at the root can create new projects for you.
+Pick a root folder once. Every sub-folder becomes a project, and each project gets its own always-on `claude remote-control` server (a launchd agent on macOS, a hidden login-startup process on Windows). You then create new sessions per project from the **Code tab** of the Claude app, and a "manager" session at the root can create new projects for you.
 
 ## Requirements
 
-- macOS (uses launchd)
+- macOS (launchd) or Windows 10/11 (login-startup launcher; **untested on real Windows so far**, please report issues)
 - [Claude Code](https://claude.com/claude-code) (`claude`), logged in with a subscription account
-- [uv](https://docs.astral.sh/uv/) (`brew install uv`)
+- [uv](https://docs.astral.sh/uv/) (`brew install uv` / `winget install astral-sh.uv`)
 
 ## Setup
 
@@ -50,7 +50,7 @@ Options: `--name <manager session name>` (default `세션관리`), `--no-mcp`, `
 
 ## CLI commands
 
-`setup`, `install-manager`, `uninstall-manager`, `show-config`, `serve` (default, runs the MCP server).
+`setup`, `install-manager`, `uninstall-manager`, `show-config`, `serve` (default, runs the MCP server), `run-server <label>` (Windows internal).
 
 ## How it works
 
@@ -58,10 +58,11 @@ Options: `--name <manager session name>` (default `세션관리`), `--no-mcp`, `
 - `claude remote-control` does not connect without a terminal, so the agent runs it under `script` (a pty) with stdin kept open.
 - `create_project` marks the new folder as trusted (it edits `~/.claude.json` after making a timestamped backup), because a launchd agent cannot answer the trust prompt. Note that this skips Claude's folder trust dialog for folders created through this tool.
 - Logs: `~/Library/Logs/session-hub/`. LaunchAgents: `~/Library/LaunchAgents/com.sessionhub.rc.*.plist`.
+- **Windows**: each server is a hidden `.vbs` launcher in your Startup folder (starts at login, no admin rights needed) that runs `session_hub_mcp.py run-server <label>`. That supervisor runs `claude remote-control` inside a pty (via `pywinpty`, installed automatically by `uv`) and restarts it after 30 s if it exits. Specs/pid files: `~/.config/session-hub/servers/`, logs: `%LOCALAPPDATA%\session-hub\logs\`. Servers start at login, not at boot.
 
 ## Environment variables (optional)
 
-`SESSION_HUB_CONFIG`, `SESSION_HUB_ROOT`, `SESSION_HUB_MANAGER_NAME`, `SESSION_HUB_CLAUDE_BIN`, `SESSION_HUB_AGENTS_DIR`, `SESSION_HUB_LOG_DIR`, `SESSION_HUB_LAUNCHCTL`, `SESSION_HUB_CLAUDE_JSON`
+`SESSION_HUB_CONFIG`, `SESSION_HUB_ROOT`, `SESSION_HUB_MANAGER_NAME`, `SESSION_HUB_CLAUDE_BIN`, `SESSION_HUB_AGENTS_DIR`, `SESSION_HUB_LOG_DIR`, `SESSION_HUB_LAUNCHCTL`, `SESSION_HUB_STARTUP_DIR` (Windows), `SESSION_HUB_CLAUDE_JSON`
 
 ## Uninstall
 
@@ -71,6 +72,8 @@ uv run --script ~/.config/session-hub/session_hub_mcp.py uninstall-manager
 launchctl bootout gui/$(id -u)/<label> && rm ~/Library/LaunchAgents/<label>.plist
 claude mcp remove --scope local session-hub   # run inside the root folder
 ```
+
+On Windows, `stop_session_server` / `uninstall-manager` stop the process and delete the Startup launcher.
 
 ## License
 

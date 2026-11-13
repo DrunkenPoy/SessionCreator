@@ -1,25 +1,29 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.10,<2"]
+# dependencies = ["mcp>=1.10,<2", "pywinpty>=2.0; sys_platform == 'win32'"]
 # ///
 """
-Session Hub — 프로젝트별 Claude Remote Control 세션 서버 관리 MCP (macOS)
+Session Hub — 프로젝트별 Claude Remote Control 세션 서버 관리 MCP (macOS / Windows)
 
 설치할 때 고른 "루트 폴더" 아래의 하위 폴더 하나하나를 프로젝트로 보고,
-프로젝트마다 `claude remote-control` 서버 모드를 launchd 에이전트로 띄워
+프로젝트마다 `claude remote-control` 서버 모드를 상시 실행으로 띄워
 Claude 앱(Code 탭)에서 프로젝트별로 새 세션을 만들 수 있게 한다.
+  macOS   : launchd 에이전트 (재부팅 후 자동 실행)
+  Windows : 시작프로그램 폴더의 숨김 런처 + 감독 프로세스(run-server), pywinpty로 pty 제공
+            (로그인 시 자동 실행)
 
 명령
   setup <루트폴더> [--name 관리세션이름]   설정 저장 + CLAUDE.md + MCP 등록
-  install-manager                          관리 세션 서버를 launchd에 등록
+  install-manager                          관리 세션 서버를 상시 실행으로 등록
   uninstall-manager                        관리 세션 서버 등록 해제
+  run-server <label>                       (Windows 내부용) 서버 감독 루프
   show-config                              현재 설정 출력
   serve (기본)                             MCP 서버로 실행
 
 설정 파일: ~/.config/session-hub/config.json  (SESSION_HUB_CONFIG로 위치 변경)
 환경 변수로 덮어쓰기(선택): SESSION_HUB_ROOT, SESSION_HUB_MANAGER_NAME,
   SESSION_HUB_CLAUDE_BIN, SESSION_HUB_AGENTS_DIR, SESSION_HUB_LOG_DIR,
-  SESSION_HUB_LAUNCHCTL(테스트용), SESSION_HUB_CLAUDE_JSON
+  SESSION_HUB_LAUNCHCTL(테스트용), SESSION_HUB_STARTUP_DIR(Windows), SESSION_HUB_CLAUDE_JSON
 """
 
 from __future__ import annotations
@@ -40,8 +44,22 @@ from pathlib import Path
 CONFIG_PATH = Path(os.environ.get("SESSION_HUB_CONFIG", "~/.config/session-hub/config.json")).expanduser()
 INSTALL_DIR = CONFIG_PATH.parent
 LABEL_PREFIX = "com.sessionhub.rc"
-AGENTS_DIR = Path(os.environ.get("SESSION_HUB_AGENTS_DIR", "~/Library/LaunchAgents")).expanduser()
-LOG_DIR = Path(os.environ.get("SESSION_HUB_LOG_DIR", "~/Library/Logs/session-hub")).expanduser()
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+if IS_WIN:
+    # 서버 등록 정보(spec json / pid 파일)를 두는 폴더, 로그 폴더, 로그인 시 자동 실행 폴더
+    AGENTS_DIR = Path(os.environ.get("SESSION_HUB_AGENTS_DIR", str(INSTALL_DIR / "servers"))).expanduser()
+    LOG_DIR = Path(os.environ.get(
+        "SESSION_HUB_LOG_DIR",
+        str(Path(os.environ.get("LOCALAPPDATA", "~/AppData/Local")).expanduser() / "session-hub" / "logs"))).expanduser()
+    STARTUP_DIR = Path(os.environ.get(
+        "SESSION_HUB_STARTUP_DIR",
+        str(Path(os.environ.get("APPDATA", "~/AppData/Roaming")).expanduser()
+            / "Microsoft/Windows/Start Menu/Programs/Startup"))).expanduser()
+else:
+    AGENTS_DIR = Path(os.environ.get("SESSION_HUB_AGENTS_DIR", "~/Library/LaunchAgents")).expanduser()
+    LOG_DIR = Path(os.environ.get("SESSION_HUB_LOG_DIR", "~/Library/Logs/session-hub")).expanduser()
+    STARTUP_DIR = None
 LAUNCHCTL = os.environ.get("SESSION_HUB_LAUNCHCTL", "launchctl")
 CLAUDE_JSON = Path(os.environ.get("SESSION_HUB_CLAUDE_JSON", "~/.claude.json")).expanduser()
 MCP_NAME = "session-hub"
@@ -50,6 +68,7 @@ DEFAULT_MANAGER_NAME = "세션관리"
 MD_BEGIN = "<!-- session-hub:begin -->"
 MD_END = "<!-- session-hub:end -->"
 
+RESTART_DELAY = 30  # 서버가 죽으면 이만큼 기다렸다가 재시작(초)
 SPAWN_MODES = ("auto", "worktree", "same-dir")
 PERMISSION_MODES = ("default", "acceptEdits", "plan", "bypassPermissions")
 _BAD_NAME = re.compile(r"[/\\:\x00-\x1f\x7f]")
@@ -105,6 +124,11 @@ def _manager_name() -> str:
 
 # ───────────────────────── 공통 유틸 ─────────────────────────
 
+def _check_platform() -> None:
+    if not (IS_MAC or IS_WIN):
+        raise RuntimeError(f"지원하지 않는 OS입니다 ({sys.platform}). macOS와 Windows만 지원합니다.")
+
+
 def _domain() -> str:
     return f"gui/{os.getuid()}"
 
@@ -116,7 +140,16 @@ def _label(key: str, root: Path | None = None) -> str:
 
 
 def _plist_path(key: str) -> Path:
-    return AGENTS_DIR / f"{_label(key)}.plist"
+    """등록 정보 파일: macOS는 launchd plist, Windows는 spec json."""
+    return AGENTS_DIR / f"{_label(key)}{'.json' if IS_WIN else '.plist'}"
+
+
+def _pid_path(key: str) -> Path:
+    return AGENTS_DIR / f"{_label(key)}.pid"
+
+
+def _launcher_path(key: str) -> Path:
+    return STARTUP_DIR / f"session-hub-{_label(key)}.vbs"
 
 
 def _log_path(key: str) -> Path:
@@ -153,9 +186,18 @@ def _find_bin(name: str, env_key: str | None = None) -> str | None:
     found = shutil.which(name)
     if found:
         return found
-    for cand in (f"~/.local/bin/{name}", f"~/.claude/local/{name}",
-                 f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}"):
-        p = Path(cand).expanduser()
+    if IS_WIN:
+        appdata = Path(os.environ.get("APPDATA", "~/AppData/Roaming")).expanduser()
+        cands = [Path(f"~/.local/bin/{name}.exe").expanduser(),
+                 Path(f"~/.claude/local/{name}.exe").expanduser(),
+                 Path(f"~/.claude/local/{name}.cmd").expanduser(),
+                 appdata / "npm" / f"{name}.cmd",
+                 appdata / "npm" / f"{name}.exe"]
+    else:
+        cands = [Path(c).expanduser() for c in (
+            f"~/.local/bin/{name}", f"~/.claude/local/{name}",
+            f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}")]
+    for p in cands:
         if p.exists():
             return str(p)
     return None
@@ -196,7 +238,7 @@ def _resolve_spawn(path: Path, spawn: str) -> str:
     return spawn
 
 
-def _service_state(key: str) -> dict:
+def _service_state_mac(key: str) -> dict:
     res = _run([LAUNCHCTL, "print", f"{_domain()}/{_label(key)}"])
     if res.returncode != 0:
         return {"loaded": False, "running": False}
@@ -218,16 +260,152 @@ def _tail(path: Path, lines: int) -> str:
     return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])
 
 
-def _bootout(key: str) -> None:
+def _bootout_mac(key: str) -> None:
     _run([LAUNCHCTL, "bootout", f"{_domain()}/{_label(key)}"])
     for _ in range(10):
-        if not _service_state(key)["loaded"]:
+        if not _service_state_mac(key)["loaded"]:
             return
         time.sleep(0.3)
 
 
+# ── Windows 백엔드: 시작프로그램 숨김 런처 + 감독 프로세스(run-server) ──
+
+def _pid_alive(pid: int) -> bool:
+    res = _run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"])
+    return res.returncode == 0 and f'"{pid}"' in res.stdout
+
+
+def _read_pid(key: str) -> int | None:
+    try:
+        return int(_pid_path(key).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _service_state_win(key: str) -> dict:
+    if not _plist_path(key).exists():
+        return {"loaded": False, "running": False}
+    pid = _read_pid(key)
+    alive = bool(pid and _pid_alive(pid))
+    return {"loaded": True, "running": alive, "pid": pid if alive else None, "last_exit": None}
+
+
+def _bootout_win(key: str) -> None:
+    pid = _read_pid(key)
+    if pid and _pid_alive(pid):
+        _run(["taskkill", "/T", "/F", "/PID", str(pid)])  # 감독 프로세스와 자식(claude) 모두 종료
+    _pid_path(key).unlink(missing_ok=True)
+
+
+def _service_state(key: str) -> dict:
+    _check_platform()
+    return _service_state_win(key) if IS_WIN else _service_state_mac(key)
+
+
+def _bootout(key: str) -> None:
+    _check_platform()
+    _bootout_win(key) if IS_WIN else _bootout_mac(key)
+
+
+def _unregister(key: str) -> bool:
+    """재부팅/로그인 후 다시 뜨지 않도록 등록 파일을 지운다. 지운 게 있으면 True."""
+    removed = False
+    targets = [_plist_path(key)]
+    if IS_WIN:
+        targets += [_launcher_path(key), _pid_path(key)]
+    for p in targets:
+        if p.exists():
+            p.unlink()
+            removed = removed or p == _plist_path(key)
+    return removed
+
+
 def _register(key: str, display_name: str, workdir: Path, spawn: str,
               permission_mode: str | None) -> dict:
+    _check_platform()
+    if permission_mode and permission_mode not in PERMISSION_MODES:
+        raise ValueError(f"permission_mode는 {PERMISSION_MODES} 중 하나여야 합니다.")
+    return (_register_win if IS_WIN else _register_mac)(key, display_name, workdir, spawn, permission_mode)
+
+
+def _vbs_quote(s: str) -> str:
+    return s.replace('"', '""')
+
+
+def _register_win(key: str, display_name: str, workdir: Path, spawn: str,
+                  permission_mode: str | None) -> dict:
+    claude_bin = _find_claude()
+    uv = _find_bin("uv")
+    if not uv:
+        raise FileNotFoundError("uv 실행 파일을 찾지 못했습니다. https://docs.astral.sh/uv/ 에서 설치하세요.")
+    script = INSTALL_DIR / "session_hub_mcp.py"
+    if not script.exists():
+        script = Path(__file__).resolve()
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    STARTUP_DIR.mkdir(parents=True, exist_ok=True)
+
+    argv = [claude_bin, "remote-control", "--spawn", spawn, "--name", display_name]
+    if permission_mode:
+        argv += ["--permission-mode", permission_mode]
+    log = str(_log_path(key))
+    spec = {"label": _label(key), "key": key, "argv": argv, "cwd": str(workdir), "log": log,
+            "env": {"SESSION_HUB_ROOT": str(_root()), "SESSION_HUB_PROJECT": key}}
+
+    _bootout(key)
+    _plist_path(key).write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+    cmd = subprocess.list2cmdline([uv, "run", "--script", str(script), "run-server", _label(key)])
+    launcher = _launcher_path(key)
+    launcher.write_text(f'CreateObject("WScript.Shell").Run "{_vbs_quote(cmd)}", 0, False\r\n', encoding="utf-8")
+    # 로그인 때까지 기다리지 않고 지금 바로 숨김 실행
+    subprocess.Popen(["wscript.exe", "//B", "//Nologo", str(launcher)],
+                     creationflags=0x00000008 | 0x00000200 | 0x08000000)  # DETACHED | NEW_PROCESS_GROUP | NO_WINDOW
+    for _ in range(20):  # 감독 프로세스가 pid 파일을 쓸 때까지 대기
+        if _read_pid(key):
+            break
+        time.sleep(0.5)
+    time.sleep(2)
+    return {
+        "name": display_name, "path": str(workdir), "spawn": spawn,
+        "label": _label(key), "spec": str(_plist_path(key)), "launcher": str(launcher), "log": log,
+        **_service_state(key),
+        "recent_log": _tail(Path(log), 15),
+    }
+
+
+def _run_server_loop(label: str) -> None:
+    """(Windows) 서버를 pty 위에서 실행하고 죽으면 재시작하는 감독 루프. 시작프로그램 런처가 호출한다."""
+    from winpty import PtyProcess
+    spec_path = AGENTS_DIR / f"{label}.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    pid_file = AGENTS_DIR / f"{label}.pid"
+    pid_file.write_text(str(os.getpid()))
+    log = Path(spec["log"])
+    log.parent.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, **spec["env"]}
+    argv = list(spec["argv"])
+    if argv[0].lower().endswith((".cmd", ".bat")):
+        argv = ["cmd.exe", "/c"] + argv
+    while spec_path.exists():
+        if log.exists() and log.stat().st_size > 1_000_000:
+            log.replace(log.with_suffix(".log.old"))
+        with open(log, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} 시작: {' '.join(argv)}\n")
+            f.flush()
+            proc = PtyProcess.spawn(argv, cwd=spec["cwd"], env=env)  # 입력을 닫지 않으므로 EOF로 종료되지 않는다
+            try:
+                while True:
+                    f.write(proc.read(4096))
+                    f.flush()
+            except EOFError:
+                pass
+            f.write(f"\n--- 종료 (exit {proc.exitstatus}), {RESTART_DELAY}초 후 재시작\n")
+        time.sleep(RESTART_DELAY)
+    pid_file.unlink(missing_ok=True)
+
+
+def _register_mac(key: str, display_name: str, workdir: Path, spawn: str,
+                  permission_mode: str | None) -> dict:
     claude_bin = _find_claude()
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -237,8 +415,6 @@ def _register(key: str, display_name: str, workdir: Path, spawn: str,
     cmd = ["/usr/bin/script", "-q", "/dev/null", claude_bin, "remote-control",
            "--spawn", spawn, "--name", display_name]
     if permission_mode:
-        if permission_mode not in PERMISSION_MODES:
-            raise ValueError(f"permission_mode는 {PERMISSION_MODES} 중 하나여야 합니다.")
         cmd += ["--permission-mode", permission_mode]
     args = ["/bin/sh", "-c", "tail -f /dev/null | exec " + " ".join(shlex.quote(a) for a in cmd)]
 
@@ -256,7 +432,7 @@ def _register(key: str, display_name: str, workdir: Path, spawn: str,
         },
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ThrottleInterval": 30,
+        "ThrottleInterval": RESTART_DELAY,
         "ProcessType": "Interactive",
         "StandardOutPath": log,
         "StandardErrorPath": log,
@@ -283,10 +459,13 @@ def _registered_keys(root: Path | None = None) -> dict[str, Path]:
     out = {}
     if not AGENTS_DIR.exists():
         return out
-    for p in AGENTS_DIR.glob(f"{LABEL_PREFIX}.*.plist"):
+    for p in AGENTS_DIR.glob(f"{LABEL_PREFIX}.*.json" if IS_WIN else f"{LABEL_PREFIX}.*.plist"):
         try:
-            with open(p, "rb") as f:
-                env = plistlib.load(f).get("EnvironmentVariables", {})
+            if IS_WIN:
+                env = json.loads(p.read_text(encoding="utf-8")).get("env", {})
+            else:
+                with open(p, "rb") as f:
+                    env = plistlib.load(f).get("EnvironmentVariables", {})
             if env.get("SESSION_HUB_ROOT") == str(root) and env.get("SESSION_HUB_PROJECT"):
                 out[env["SESSION_HUB_PROJECT"]] = p
         except Exception:
@@ -332,7 +511,7 @@ def create_project(name: str, description: str = "", git_init: bool = True,
 
     git_info = None
     if git_init:
-        (path / ".gitignore").write_text(".DS_Store\n.claude/worktrees/\n", encoding="utf-8")
+        (path / ".gitignore").write_text(".DS_Store\nThumbs.db\n.claude/worktrees/\n", encoding="utf-8")
         commit = ["git", "commit", "-q", "-m", "Initial commit (session hub)"]
         if not _run(["git", "config", "user.email"], cwd=path).stdout.strip():
             commit = ["git", "-c", "user.name=Session Hub", "-c", "user.email=session-hub@localhost"] + commit[1:]
@@ -365,10 +544,7 @@ def stop_session_server(name: str, unregister: bool = True) -> dict:
     프로젝트 폴더와 파일은 건드리지 않는다."""
     key = _validate_name(name)
     _bootout(key)
-    removed = False
-    if unregister and _plist_path(key).exists():
-        _plist_path(key).unlink()
-        removed = True
+    removed = _unregister(key) if unregister else False
     return {"name": key, "stopped": not _service_state(key)["loaded"], "unregistered": removed}
 
 
@@ -389,9 +565,14 @@ def _trust_path(path: Path) -> dict:
     backup = CLAUDE_JSON.with_name(CLAUDE_JSON.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
     shutil.copy2(CLAUDE_JSON, backup)
     data = json.loads(CLAUDE_JSON.read_text(encoding="utf-8"))
-    entry = data.setdefault("projects", {}).setdefault(str(path), {})
-    already = bool(entry.get("hasTrustDialogAccepted"))
-    entry["hasTrustDialogAccepted"] = True
+    projects = data.setdefault("projects", {})
+    # Windows에서는 Claude가 경로를 슬래시(C:/...)로 저장할 수 있어 두 표기 모두 신뢰 처리한다.
+    keys = {str(path)} | ({path.as_posix()} if IS_WIN else set())
+    already = True
+    for k in keys:
+        entry = projects.setdefault(k, {})
+        already = already and bool(entry.get("hasTrustDialogAccepted"))
+        entry["hasTrustDialogAccepted"] = True
     tmp = CLAUDE_JSON.with_name(CLAUDE_JSON.name + ".tmp-session-hub")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, CLAUDE_JSON)
@@ -424,6 +605,7 @@ def _write_claude_md(root: Path) -> str:
 
 
 def cmd_setup(root_arg: str, manager_name: str, register_mcp: bool, force: bool) -> None:
+    _check_platform()
     root = Path(root_arg).expanduser().resolve()
 
     old = _load_config().get("root") if CONFIG_PATH.exists() else None
@@ -480,8 +662,8 @@ def cmd_setup(root_arg: str, manager_name: str, register_mcp: bool, force: bool)
 
 
 def _q(s) -> str:
-    import shlex
-    return shlex.quote(str(s))
+    s = str(s)
+    return subprocess.list2cmdline([s]) if IS_WIN else shlex.quote(s)
 
 
 def cmd_install_manager() -> None:
@@ -492,8 +674,7 @@ def cmd_install_manager() -> None:
 
 def cmd_uninstall_manager() -> None:
     _bootout(MANAGER_KEY)
-    if _plist_path(MANAGER_KEY).exists():
-        _plist_path(MANAGER_KEY).unlink()
+    _unregister(MANAGER_KEY)
     print("관리 세션 서버 등록을 해제했습니다.")
 
 
@@ -527,6 +708,8 @@ def main() -> None:
     s.add_argument("--no-mcp", action="store_true", help="MCP 자동 등록 생략")
     s.add_argument("--force", action="store_true", help="이전 루트에 서버가 남아 있어도 진행")
     sub.add_parser("install-manager")
+    r = sub.add_parser("run-server", help="(Windows 내부용) 서버 감독 루프")
+    r.add_argument("label")
     sub.add_parser("uninstall-manager")
     sub.add_parser("show-config")
     sub.add_parser("serve")
@@ -534,6 +717,8 @@ def main() -> None:
 
     if a.cmd == "setup":
         cmd_setup(a.root, a.name, not a.no_mcp, a.force)
+    elif a.cmd == "run-server":
+        _run_server_loop(a.label)
     elif a.cmd == "install-manager":
         cmd_install_manager()
     elif a.cmd == "uninstall-manager":
