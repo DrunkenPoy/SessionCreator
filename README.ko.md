@@ -8,7 +8,7 @@
 
 ## 요구 사항
 
-- macOS (launchd) 또는 Windows 10/11 (로그인 시작 런처 방식, **아직 실제 Windows에서는 검증되지 않았습니다** — 문제가 있으면 알려주세요)
+- macOS (launchd) 또는 Windows 10/11 (로그인 시작 런처 방식)
 - [Claude Code](https://claude.com/claude-code) (`claude`), 구독 계정으로 로그인
 - [uv](https://docs.astral.sh/uv/) (`brew install uv` / `winget install astral-sh.uv`)
 

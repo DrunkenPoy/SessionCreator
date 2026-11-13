@@ -8,7 +8,7 @@ Pick a root folder once. Every sub-folder becomes a project, and each project ge
 
 ## Requirements
 
-- macOS (launchd) or Windows 10/11 (login-startup launcher; **untested on real Windows so far**, please report issues)
+- macOS (launchd) or Windows 10/11 (login-startup launcher)
 - [Claude Code](https://claude.com/claude-code) (`claude`), logged in with a subscription account
 - [uv](https://docs.astral.sh/uv/) (`brew install uv` / `winget install astral-sh.uv`)
 
