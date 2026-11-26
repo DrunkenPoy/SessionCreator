@@ -73,6 +73,10 @@ uv run --script session_hub_mcp.py setup ~/Projects   # 루트 폴더
 
 `setup`, `install-manager`, `uninstall-manager`, `show-config`, `serve` (기본값, MCP 서버 실행), `run-server <label>` (Windows 내부용).
 
+## SessionCreator 스킬
+
+[SKILL.md](SKILL.md)에 에이전트의 도구 호출 기준, Windows·macOS 설치 절차, 로컬 MCP 설정 템플릿과 요청 예제를 담았습니다. 스킬을 사용하려면 사용자 PC에서 SessionCreator의 로컬 `session-hub` MCP 서버를 연결해야 합니다.
+
 ## 동작 방식
 
 - 각 서버는 `claude remote-control --spawn <auto|worktree|same-dir> --name <프로젝트>`를 launchd 에이전트(`RunAtLoad`, `KeepAlive`)로 실행하므로 재부팅 후에도 다시 뜹니다. `auto`는 커밋이 하나 이상 있는 git 레포면 `worktree`, 아니면 `same-dir`입니다.
