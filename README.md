@@ -73,6 +73,10 @@ Options: `--name <manager session name>` (default `세션관리`), `--no-mcp`, `
 
 `setup`, `install-manager`, `uninstall-manager`, `show-config`, `serve` (default, runs the MCP server), `run-server <label>` (Windows internal).
 
+## SessionCreator skill
+
+[SKILL.md](SKILL.md) contains the agent workflow, Windows and macOS setup, a local MCP configuration template, and example requests. The skill requires SessionCreator's local `session-hub` MCP server on the user's machine.
+
 ## How it works
 
 - Each server runs `claude remote-control --spawn <auto|worktree|same-dir> --name <project>` as a launchd agent (`RunAtLoad`, `KeepAlive`), so it comes back after a reboot. `auto` uses `worktree` when the project is a git repo with at least one commit, otherwise `same-dir`.
